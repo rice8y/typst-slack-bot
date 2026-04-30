@@ -583,6 +583,10 @@ fn format_response_metadata(metadata: Option<&SlackResponseMetadata>) -> String 
 	}
 }
 
+fn code_block(raw: &str) -> String {
+	format!("```\n{}\n```", sanitize_code_block(raw))
+}
+
 #[derive(Clone)]
 struct SlackTarget {
 	channel: String,
@@ -596,6 +600,7 @@ struct AppState {
 	database: std::sync::Mutex<Connection>,
 	seen_events: Mutex<SeenEvents>,
 	tag_admins: HashSet<String>,
+	show_progress: bool,
 }
 
 struct SeenEvents {
@@ -811,10 +816,7 @@ async fn process_event(
 				.slack
 				.post_message(
 					&target,
-					format!(
-						"An error occurred:\n```ansi\n{}```",
-						sanitize_code_block(&error.to_string())
-					),
+					format!("An error occurred:\n{}", code_block(&error.to_string())),
 				)
 				.await
 		}
@@ -869,8 +871,10 @@ async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<()
 				progress.reserve(item.len() + 1);
 				progress.push_str(&item);
 				progress.push('\n');
-				let message = format!("Progress: ```ansi\n{}\n```", sanitize_code_block(&progress));
-				_ = state.slack.post_message(target, message).await;
+				if state.show_progress {
+					let message = format!("Progress:\n{}", code_block(&progress));
+					_ = state.slack.post_message(target, message).await;
+				}
 			}
 		})
 	};
@@ -895,8 +899,8 @@ async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<()
 			if !res.warnings.is_empty() {
 				writeln!(
 					content,
-					"Render succeeded with warnings:\n```ansi\n{}\n```",
-					sanitize_code_block(&res.warnings),
+					"Render succeeded with warnings:\n{}",
+					code_block(&res.warnings),
 				)?;
 			}
 
@@ -922,10 +926,7 @@ async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<()
 				.slack
 				.post_message(
 					target,
-					format!(
-						"An error occurred:\n```ansi\n{}\n```",
-						sanitize_code_block(&format!("{error:?}"))
-					),
+					format!("An error occurred:\n{}", code_block(&format!("{error:?}"))),
 				)
 				.await?;
 		}
@@ -958,14 +959,11 @@ async fn ast(state: &AppState, target: &SlackTarget, args: &str) -> Result<(), B
 
 	match res {
 		Ok(ast) => {
-			let message = format!("```ansi\n{}```", sanitize_code_block(&ast));
+			let message = code_block(&ast);
 			state.slack.post_message(target, message).await?;
 		}
 		Err(error) => {
-			let message = format!(
-				"An error occurred:\n```ansi\n{}```",
-				sanitize_code_block(&format!("{error:?}")),
-			);
+			let message = format!("An error occurred:\n{}", code_block(&format!("{error:?}")),);
 			state.slack.post_message(target, message).await?;
 		}
 	}
@@ -988,7 +986,7 @@ The bot is using Typst version <https://github.com/typst/typst/releases/v{typst_
 			state.slack.post_message(target, message).await?;
 		}
 		Err(error) => {
-			let message = format!("An error occurred:\n```ansi\n{error}```");
+			let message = format!("An error occurred:\n{}", code_block(&error.to_string()));
 			state.slack.post_message(target, message).await?;
 		}
 	}
@@ -1155,11 +1153,21 @@ fn read_secret(env_name: &str, file_env_name: &str) -> String {
 	.to_owned()
 }
 
+fn env_flag(name: &str, default: bool) -> bool {
+	std::env::var(name).map_or(default, |raw| {
+		matches!(
+			raw.trim().to_ascii_lowercase().as_str(),
+			"1" | "true" | "yes" | "on"
+		)
+	})
+}
+
 pub async fn run() {
 	let token = read_secret("SLACK_BOT_TOKEN", "SLACK_BOT_TOKEN_FILE");
 	let signing_secret = read_secret("SLACK_SIGNING_SECRET", "SLACK_SIGNING_SECRET_FILE");
 	let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_owned());
 	let bind_addr: SocketAddr = bind_addr.parse().expect("`BIND_ADDR` must be host:port");
+	let show_progress = env_flag("TYPST_BOT_SHOW_PROGRESS", false);
 
 	let database = Connection::open_with_flags(
 		std::env::var_os("DB_PATH").expect("need `DB_PATH` env var"),
@@ -1185,6 +1193,7 @@ pub async fn run() {
 		database,
 		seen_events: Mutex::new(SeenEvents::new()),
 		tag_admins,
+		show_progress,
 	});
 
 	let listener = TcpListener::bind(bind_addr).await.unwrap();

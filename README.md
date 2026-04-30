@@ -38,6 +38,8 @@ Optional environment variables:
 
 - `BIND_ADDR`, default `0.0.0.0:3000`
 - `TYPST_BOT_WORKER_PATH`, default `./worker`
+- `TYPST_BOT_SHOW_PROGRESS`, set to `true`, `1`, `yes`, or `on` to post
+  package download progress messages. Defaults to disabled.
 - `SLACK_TAG_ADMIN_USERS`, comma-separated Slack user IDs allowed to change tags.
   If unset, anyone can change channel-local tags.
 
