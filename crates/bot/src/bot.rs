@@ -20,7 +20,7 @@ use reqwest::Client;
 use ring::hmac;
 use rusqlite::{named_params, Connection, OpenFlags};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::join;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
@@ -310,11 +310,14 @@ fn extract_code_block(input: &str) -> Result<CodeBlock, ParseCommandError> {
 
 	if let Some(start) = input.find("```") {
 		let code = &input[start + 3..];
-		let (language, code) = code
-			.split_once('\n')
-			.map_or((None, code), |(language, code)| {
-				(Some(language.trim()), code)
-			});
+		let (language, code) = code.split_once('\n').map_or((None, code), |(first, rest)| {
+			let first = first.trim();
+			if first.is_empty() || is_code_fence_language(first) {
+				(Some(first), rest)
+			} else {
+				(None, code)
+			}
+		});
 		let Some(end) = code.find("```") else {
 			return Err(ParseCommandError::MissingCode);
 		};
@@ -336,6 +339,12 @@ fn extract_code_block(input: &str) -> Result<CodeBlock, ParseCommandError> {
 	Ok(CodeBlock {
 		source: clean_code_source(input, None),
 	})
+}
+
+fn is_code_fence_language(first_line: &str) -> bool {
+	first_line
+		.chars()
+		.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '+')
 }
 
 fn clean_code_source(raw: &str, language: Option<&str>) -> String {
@@ -447,17 +456,20 @@ impl SlackClient {
 			error: Option<String>,
 			upload_url: Option<String>,
 			file_id: Option<String>,
+			response_metadata: Option<SlackResponseMetadata>,
 		}
 
+		let length = image.len().to_string();
+		let alt_txt = format!("Typst rendered page {filename}");
 		let upload_url_response: UploadUrlResponse = self
 			.client
 			.post("https://slack.com/api/files.getUploadURLExternal")
 			.bearer_auth(&*self.token)
-			.json(&json!({
-				"filename": filename,
-				"length": image.len(),
-				"alt_txt": format!("Typst rendered page {filename}"),
-			}))
+			.form(&[
+				("filename", filename),
+				("length", length.as_str()),
+				("alt_txt", alt_txt.as_str()),
+			])
 			.send()
 			.await?
 			.json()
@@ -466,10 +478,11 @@ impl SlackClient {
 		if !upload_url_response.ok {
 			return Err(
 				format!(
-					"files.getUploadURLExternal failed: {}",
+					"files.getUploadURLExternal failed: {}{}",
 					upload_url_response
 						.error
-						.unwrap_or_else(|| "unknown error".to_owned())
+						.unwrap_or_else(|| "unknown error".to_owned()),
+					format_response_metadata(upload_url_response.response_metadata.as_ref()),
 				)
 				.into(),
 			);
@@ -499,16 +512,29 @@ impl SlackClient {
 			);
 		}
 
+		let mut complete_upload = serde_json::Map::from_iter([
+			(
+				"channel_id".to_owned(),
+				Value::String(target.channel.clone()),
+			),
+			(
+				"thread_ts".to_owned(),
+				Value::String(target.thread_ts.clone()),
+			),
+			(
+				"files".to_owned(),
+				json!([{"id": file_id, "title": filename}]),
+			),
+		]);
+		if let Some(initial_comment) = initial_comment {
+			complete_upload.insert("initial_comment".to_owned(), Value::String(initial_comment));
+		}
+
 		let response: SlackApiResponse = self
 			.client
 			.post("https://slack.com/api/files.completeUploadExternal")
 			.bearer_auth(&*self.token)
-			.json(&json!({
-				"channel_id": target.channel,
-				"thread_ts": target.thread_ts,
-				"initial_comment": initial_comment,
-				"files": [{"id": file_id, "title": filename}],
-			}))
+			.json(&complete_upload)
 			.send()
 			.await?
 			.json()
@@ -521,6 +547,12 @@ impl SlackClient {
 struct SlackApiResponse {
 	ok: bool,
 	error: Option<String>,
+	response_metadata: Option<SlackResponseMetadata>,
+}
+
+#[derive(Deserialize)]
+struct SlackResponseMetadata {
+	messages: Option<Vec<String>>,
 }
 
 impl SlackApiResponse {
@@ -530,12 +562,24 @@ impl SlackApiResponse {
 		} else {
 			Err(
 				format!(
-					"{method} failed: {}",
-					self.error.unwrap_or_else(|| "unknown error".to_owned())
+					"{method} failed: {}{}",
+					self.error.unwrap_or_else(|| "unknown error".to_owned()),
+					format_response_metadata(self.response_metadata.as_ref()),
 				)
 				.into(),
 			)
 		}
+	}
+}
+
+fn format_response_metadata(metadata: Option<&SlackResponseMetadata>) -> String {
+	let Some(messages) = metadata.and_then(|metadata| metadata.messages.as_ref()) else {
+		return String::new();
+	};
+	if messages.is_empty() {
+		String::new()
+	} else {
+		format!(" ({})", messages.join("; "))
 	}
 }
 
@@ -1176,6 +1220,14 @@ mod tests {
 		assert!(matches!(flags.preamble.page_size, PageSize::Auto));
 		assert!(matches!(flags.preamble.theme, Theme::Light));
 		assert_eq!(code.source, "= Hello\n");
+	}
+
+	#[test]
+	fn preserves_same_line_code_that_is_not_a_language() {
+		let (_flags, code) =
+			parse_render_args("```#import \"@preview/auto-jrubby:0.3.4\": *\n#show-ruby(\"東京\")\n```")
+				.unwrap();
+		assert!(code.source.starts_with("#import "));
 	}
 
 	#[test]
