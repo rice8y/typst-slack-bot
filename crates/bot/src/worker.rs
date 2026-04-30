@@ -8,6 +8,13 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+fn timeout_from_env(var: &str, default_seconds: u64) -> Duration {
+	std::env::var(var)
+		.ok()
+		.and_then(|raw| raw.parse::<u64>().ok())
+		.map_or(Duration::from_secs(default_seconds), Duration::from_secs)
+}
+
 #[derive(Debug)]
 pub struct Worker {
 	process: Process,
@@ -28,9 +35,9 @@ impl Worker {
 		struct Timeout;
 
 		// This timeout is reset any time a progress message is received.
-		let fast_timeout = Duration::from_secs(5);
+		let fast_timeout = timeout_from_env("TYPST_BOT_WORKER_FAST_TIMEOUT_SECS", 60);
 		// This is a universal timeout that is never reset.
-		let long_timeout = Duration::from_secs(30);
+		let long_timeout = timeout_from_env("TYPST_BOT_WORKER_LONG_TIMEOUT_SECS", 300);
 		let mut tries_left = 2;
 
 		loop {

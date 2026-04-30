@@ -10,6 +10,8 @@ use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt as _};
 
+const MAX_PACKAGE_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+
 struct FileEntry {
 	bytes: Bytes,
 	/// This field is filled on demand.
@@ -139,6 +141,8 @@ impl Sandbox {
 
 		let compressed_archive = response
 			.into_body()
+			.with_config()
+			.limit(MAX_PACKAGE_ARCHIVE_BYTES)
 			.read_to_vec()
 			.map_err(|error| PackageError::NetworkFailed(Some(eco_format!("{error}"))))?;
 		let raw_archive = zune_inflate::DeflateDecoder::new(&compressed_archive)
