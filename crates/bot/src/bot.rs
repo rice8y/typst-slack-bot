@@ -115,8 +115,8 @@ impl FromStr for PageSize {
 
 #[derive(Default, Debug, Clone, Copy)]
 enum PageSize {
-	#[default]
 	Preview,
+	#[default]
 	Auto,
 	Default,
 }
@@ -138,6 +138,12 @@ struct Preamble {
 }
 
 impl Preamble {
+	/// Apply defaults before the user source so its set rules take precedence.
+	fn apply(self, mut source: String) -> String {
+		source.insert_str(0, &self.preamble());
+		source
+	}
+
 	fn preamble(self) -> String {
 		let page_size = self.page_size.preamble();
 		let theme = self.theme.preamble();
@@ -178,8 +184,8 @@ Render command syntax:
 
 *Flags*
 - `pagesize=` (alias: `ps=`):
-  - `preview` (alias `p`, default): 10pt margin, 300pt width, auto height
-  - `auto` (alias `a`): 10pt margin, auto width, auto height
+  - `auto` (alias `a`, default): 10pt margin, auto width, auto height (standalone)
+  - `preview` (alias `p`): 10pt margin, 300pt width, auto height
   - `default` (alias `d`): Leave as Typst's default
 - `theme=` (alias `t=`):
   - `dark` (alias `d`, default): Set text and background to match Slack's light theme
@@ -190,6 +196,10 @@ To be clear, the full default preamble is:
 ```
 {default_preamble}
 ```
+Page settings in your Typst code override the corresponding preamble defaults.
+For example, `#set page(\"a4\")` sets an A4 page; `#set page(width: 200pt)`
+sets only the width and leaves the default auto height and 10pt margins in place.
+To use Typst's native paper size and margins, use `pagesize=default`.
 To remove the preamble entirely, use `pagesize=default theme=transparent`.
 
 *Examples*
@@ -859,8 +869,7 @@ async fn process_command(
 
 async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<(), BotError> {
 	let (flags, code) = parse_render_args(args)?;
-	let mut source = code.source;
-	source.insert_str(0, &flags.preamble.preamble());
+	let source = flags.preamble.apply(code.source);
 
 	let mut progress = String::new();
 	let (progress_send, mut progress_recv) = mpsc::channel(4);
@@ -1229,6 +1238,92 @@ mod tests {
 		assert!(matches!(flags.preamble.page_size, PageSize::Auto));
 		assert!(matches!(flags.preamble.theme, Theme::Light));
 		assert_eq!(code.source, "= Hello\n");
+	}
+
+	#[test]
+	fn defaults_to_standalone_pages_with_margins() {
+		let (flags, code) = parse_render_args("`hello, world!`").unwrap();
+		assert!(matches!(flags.preamble.page_size, PageSize::Auto));
+		assert_eq!(
+			flags.preamble.page_size.preamble(),
+			"#set page(width: auto, height: auto, margin: 10pt)\n",
+		);
+		assert_eq!(code.source, "hello, world!");
+	}
+
+	#[test]
+	fn theme_only_flags_keep_standalone_page_defaults() {
+		for theme in ["dark", "light", "transparent"] {
+			let (flags, _) = parse_render_args(&format!("theme={theme} `hello`")).unwrap();
+			assert!(matches!(flags.preamble.page_size, PageSize::Auto));
+		}
+	}
+
+	#[test]
+	fn explicit_page_presets_and_aliases_override_the_default() {
+		for key in ["pagesize", "ps"] {
+			for (value, expected) in [
+				("preview", PageSize::Preview),
+				("p", PageSize::Preview),
+				("auto", PageSize::Auto),
+				("a", PageSize::Auto),
+				("default", PageSize::Default),
+				("d", PageSize::Default),
+			] {
+				let (flags, _) = parse_render_args(&format!("{key}={value} `hello`")).unwrap();
+				assert_eq!(flags.preamble.page_size.preamble(), expected.preamble());
+			}
+		}
+	}
+
+	#[test]
+	fn explicit_preview_keeps_its_fixed_width() {
+		let (flags, _) = parse_render_args("pagesize=preview `hello`").unwrap();
+		assert_eq!(
+			flags.preamble.page_size.preamble(),
+			"#set page(width: 300pt, height: auto, margin: 10pt)\n",
+		);
+	}
+
+	#[test]
+	fn native_page_mode_does_not_inject_page_geometry() {
+		let (flags, _) = parse_render_args("pagesize=default `hello`").unwrap();
+		let preamble = flags.preamble.preamble();
+		assert!(!preamble.contains("width:"));
+		assert!(!preamble.contains("height:"));
+		assert!(!preamble.contains("margin:"));
+	}
+
+	#[test]
+	fn user_page_settings_remain_after_all_preamble_defaults() {
+		for preset in ["auto", "preview", "default"] {
+			for source in [
+				"#set page(\"a4\")\nHello",
+				"#set page(width: 200pt, height: 100pt, margin: 0pt)\nHello",
+				"#set page(width: 200pt)\nHello",
+				"#set page(height: 100pt)\nHello",
+				"#set page(margin: (x: 5pt, y: 8pt))\nHello",
+				"#let w = 200pt\n#set page(width: w)\nHello",
+				"#page(width: 200pt, height: 100pt)[Hello]",
+				"First\n#set page(\"a4\")\nSecond",
+			] {
+				let input = format!("pagesize={preset} ```typst\n{source}\n```");
+				let (flags, code) = parse_render_args(&input).unwrap();
+				let preamble = flags.preamble.preamble();
+				let prepared = flags.preamble.apply(code.source);
+				assert_eq!(prepared, format!("{preamble}{source}\n"));
+			}
+		}
+	}
+
+	#[test]
+	fn opting_out_of_the_preamble_preserves_the_source() {
+		let (flags, code) = parse_render_args(
+			"pagesize=default theme=transparent ```typst\n#set page(\"a4\")\nHello\n```",
+		)
+		.unwrap();
+		assert!(flags.preamble.preamble().is_empty());
+		assert_eq!(flags.preamble.apply(code.source), "#set page(\"a4\")\nHello\n");
 	}
 
 	#[test]
