@@ -357,8 +357,37 @@ fn is_code_fence_language(first_line: &str) -> bool {
 		.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '+')
 }
 
+fn restore_slack_links(raw: &str) -> String {
+	let mut restored = String::with_capacity(raw.len());
+	let mut remaining = raw;
+	while let Some((before, after)) = remaining.split_once('<') {
+		restored.push_str(before);
+		if let Some((link, rest)) = after.split_once('>') {
+			let (url, display) = link.split_once('|').unwrap_or((link, link));
+			if ["http://", "https://", "mailto:"]
+				.iter()
+				.any(|prefix| url.starts_with(prefix))
+				&& !url.chars().any(char::is_whitespace)
+			{
+				restored.push_str(display);
+				remaining = rest;
+				continue;
+			}
+		}
+		restored.push('<');
+		remaining = after;
+	}
+	restored.push_str(remaining);
+	restored
+}
+
 fn clean_code_source(raw: &str, language: Option<&str>) -> String {
-	let mut source = raw.to_owned();
+	// Restore links before decoding entities to preserve literal angle brackets.
+	// Decode ampersands last so literal entities such as &amp;gt; stay literal.
+	let mut source = restore_slack_links(raw)
+		.replace("&lt;", "<")
+		.replace("&gt;", ">")
+		.replace("&amp;", "&");
 	if language == Some("ansi") {
 		source = strip_ansi_escapes::strip_str(source);
 	}
@@ -594,7 +623,11 @@ fn format_response_metadata(metadata: Option<&SlackResponseMetadata>) -> String 
 }
 
 fn code_block(raw: &str) -> String {
-	format!("```\n{}\n```", sanitize_code_block(raw))
+	let escaped = raw
+		.replace('&', "&amp;")
+		.replace('<', "&lt;")
+		.replace('>', "&gt;");
+	format!("```\n{}\n```", sanitize_code_block(&escaped))
 }
 
 #[derive(Clone)]
@@ -1323,7 +1356,10 @@ mod tests {
 		)
 		.unwrap();
 		assert!(flags.preamble.preamble().is_empty());
-		assert_eq!(flags.preamble.apply(code.source), "#set page(\"a4\")\nHello\n");
+		assert_eq!(
+			flags.preamble.apply(code.source),
+			"#set page(\"a4\")\nHello\n"
+		);
 	}
 
 	#[test]
@@ -1338,5 +1374,81 @@ mod tests {
 	fn parses_inline_code() {
 		let (_flags, code) = parse_render_args("`hello, world!` extra").unwrap();
 		assert_eq!(code.source, "hello, world!");
+	}
+
+	#[test]
+	fn restores_slack_escaped_typst_in_all_code_formats() {
+		let encoded = "#let seq = \"abcdefghijklmnopqrstuvwxyz!@#$%^&amp;*\".split(\"\").slice(1, 35).map(it =&gt; raw(it))\n#let y = 1\n#if y &gt;= 0 and y &lt; 32 { [ok] }";
+		let expected = "#let seq = \"abcdefghijklmnopqrstuvwxyz!@#$%^&*\".split(\"\").slice(1, 35).map(it => raw(it))\n#let y = 1\n#if y >= 0 and y < 32 { [ok] }";
+		for args in [
+			format!("```\n{encoded}\n```"),
+			format!("```typst\n{encoded}\n```"),
+			format!("`{encoded}\n`"),
+			format!("{encoded}\n"),
+		] {
+			let expected_source = if args.starts_with('`') {
+				format!("{expected}\n")
+			} else {
+				expected.to_owned()
+			};
+			let text = format!("<@U123> r {args}");
+			let command = parse_command(&text).unwrap();
+			let (_, code) = parse_render_args(command.args).unwrap();
+			assert_eq!(code.source, expected_source);
+		}
+	}
+
+	#[test]
+	fn restores_math_shorthand_for_ast() {
+		assert_eq!(extract_code_block("$-&gt;$").unwrap().source, "$->$");
+	}
+
+	#[test]
+	fn restores_auto_linked_identifiers_in_render_and_ast() {
+		let raw = "text(fill: col, <http://chars.at|chars.at>(i))";
+		let expected = "text(fill: col, chars.at(i))";
+		let text = format!("<@U123> r ```\n{raw}\n```");
+		let command = parse_command(&text).unwrap();
+		let (_, code) = parse_render_args(command.args).unwrap();
+		assert_eq!(code.source, format!("{expected}\n"));
+		assert_eq!(extract_code_block(raw).unwrap().source, expected);
+	}
+
+	#[test]
+	fn restores_link_text_before_decoding_slack_entities() {
+		assert_eq!(
+			clean_code_source(
+				"<http://chars.at|chars.at>(i) <https://example.com?a=1&amp;b=2> <https://example.com|a &lt; b> <mailto:a@example.com|a@example.com>",
+				None,
+			),
+			"chars.at(i) https://example.com?a=1&b=2 a < b a@example.com",
+		);
+	}
+
+	#[test]
+	fn preserves_typst_labels_and_literal_or_incomplete_links() {
+		assert_eq!(
+			clean_code_source(
+				"<label> &lt;http://chars.at|chars.at&gt; &lt;= <http://unfinished",
+				None,
+			),
+			"<label> <http://chars.at|chars.at> <= <http://unfinished",
+		);
+	}
+
+	#[test]
+	fn slack_entities_are_decoded_only_once() {
+		assert_eq!(
+			clean_code_source("&amp;lt; &amp;gt; &amp;amp; &#x20; &quot;", None),
+			"&lt; &gt; &amp; &#x20; &quot;",
+		);
+	}
+
+	#[test]
+	fn code_blocks_escape_slack_control_characters_for_display() {
+		assert_eq!(
+			code_block("$->$ <label> &amp;"),
+			"```\n$-&gt;$ &lt;label&gt; &amp;amp;\n```",
+		);
 	}
 }
