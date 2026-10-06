@@ -5,8 +5,8 @@ use std::ops::Range;
 
 use ariadne::{Cache, Config, Label, Report};
 use typst::diag::SourceDiagnostic;
-use typst::syntax::FileId;
-use typst::World;
+use typst::syntax::{DiagSpan, DiagSpanKind, FileId, VirtualRoot};
+use typst::{World, WorldExt};
 
 use crate::sandbox::WithSource;
 
@@ -174,7 +174,11 @@ impl Cache<FileId> for SourceCache<'_> {
 	}
 
 	fn display<'a>(&self, id: &'a FileId) -> Option<impl std::fmt::Display + 'a> {
-		Some(Box::new(format!("{id:?}")))
+		let path = id.vpath().get_with_slash();
+		Some(match id.root() {
+			VirtualRoot::Project => path.to_owned(),
+			VirtualRoot::Package(package) => format!("{package}{path}"),
+		})
 	}
 }
 
@@ -213,6 +217,30 @@ impl ariadne::Span for Span {
 
 const MAX_LEN: usize = 1950;
 
+fn diagnostic_span(sandbox: &WithSource, typst_span: DiagSpan) -> Option<Span> {
+	let file_id = typst_span.id()?;
+	let source = sandbox.source(file_id).ok()?;
+	let mut byte_span = sandbox.range(typst_span)?;
+	if matches!(typst_span.get(), DiagSpanKind::Range { .. }) {
+		// External data ranges refer to raw bytes; cached source text has its BOM removed.
+		let stripped_bytes = sandbox
+			.file(file_id)
+			.map_or(0, |bytes| bytes.len().saturating_sub(source.text().len()));
+		byte_span =
+			byte_span.start.saturating_sub(stripped_bytes)..byte_span.end.saturating_sub(stripped_bytes);
+	}
+	let mut char_span = byte_span_to_char_span(source.text(), byte_span)?;
+	// Avoid empty spans.
+	if char_span.end == char_span.start {
+		char_span.end += 1;
+	}
+	Some(Span {
+		file_id,
+		char_span_start: char_span.start,
+		char_span_end: char_span.end,
+	})
+}
+
 pub fn format_diagnostics(sandbox: &WithSource, diagnostics: &[SourceDiagnostic]) -> String {
 	let mut cache = SourceCache::new(sandbox);
 
@@ -221,23 +249,7 @@ pub fn format_diagnostics(sandbox: &WithSource, diagnostics: &[SourceDiagnostic]
 	let mut diagnostics = diagnostics.iter();
 	while let Some(diagnostic) = diagnostics.next() {
 		let typst_span = diagnostic.span;
-		let span = typst_span.id().map(|file_id| {
-			let source = sandbox
-				.source(file_id)
-				.expect("invalid file ID in diagnostic span");
-			let byte_span = source.range(typst_span).unwrap();
-			let mut char_span = byte_span_to_char_span(source.text(), byte_span)
-				.expect("invalid byte span reported by typst diagnostic");
-			// Avoid empty spans.
-			if char_span.end == char_span.start {
-				char_span.end += 1;
-			}
-			Span {
-				file_id,
-				char_span_start: char_span.start,
-				char_span_end: char_span.end,
-			}
-		});
+		let span = diagnostic_span(sandbox, typst_span);
 
 		let report_kind = severity_to_report_kind(diagnostic.severity);
 		let source_id = typst_span
@@ -253,8 +265,16 @@ pub fn format_diagnostics(sandbox: &WithSource, diagnostics: &[SourceDiagnostic]
 			report = report.with_label(Label::new(span));
 		}
 
-		if !diagnostic.hints.is_empty() {
-			report = report.with_help(diagnostic.hints.join("\n"));
+		let mut help = Vec::new();
+		for hint in &diagnostic.hints {
+			if let Some(span) = diagnostic_span(sandbox, hint.span) {
+				report = report.with_label(Label::new(span).with_message(&hint.v));
+			} else {
+				help.push(hint.v.as_str());
+			}
+		}
+		if !help.is_empty() {
+			report = report.with_help(help.join("\n"));
 		}
 
 		let report = report.finish();

@@ -1,7 +1,10 @@
 use std::io::Cursor;
 
 use protocol::Rendered;
-use typst::layout::{Axis, PagedDocument, Size};
+use typst::layout::{Axis, Size};
+use typst::utils::Scalar;
+use typst_layout::PagedDocument;
+use typst_render::RenderOptions;
 
 use crate::diagnostic::format_diagnostics;
 use crate::sandbox::Sandbox;
@@ -62,12 +65,18 @@ pub fn render(sandbox: &Sandbox, source: String) -> Result<Rendered, String> {
 	let mut total_attachment_size = 0;
 
 	let images = document
-		.pages
+		.pages()
 		.iter()
 		.take(PAGE_LIMIT)
 		.map(|page| {
 			let pixels_per_point = determine_pixels_per_point(page.frame.size()).map_err(to_string)?;
-			let pixmap = typst_render::render(page, pixels_per_point);
+			let pixmap = typst_render::render(
+				page,
+				&RenderOptions {
+					pixel_per_pt: Scalar::new(f64::from(pixels_per_point)),
+					..RenderOptions::default()
+				},
+			);
 
 			let mut writer = Cursor::new(Vec::new());
 
@@ -94,7 +103,7 @@ pub fn render(sandbox: &Sandbox, source: String) -> Result<Rendered, String> {
 		})
 		.collect::<Result<Vec<_>, String>>()?;
 
-	let more_pages = document.pages.len() - images.len();
+	let more_pages = document.pages().len() - images.len();
 
 	Ok(Rendered {
 		images,

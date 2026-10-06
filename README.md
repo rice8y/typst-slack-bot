@@ -13,6 +13,12 @@ The bot listens for Slack Events API `app_mention` events. Slack sends mentions 
 
 ## Hosting
 
+Building from source requires Rust 1.92 or newer. Build both binaries with:
+
+```sh
+cargo build --release --workspace
+```
+
 The bot uses two binaries:
 
 - `typst-bot`: receives Slack HTTP events and calls Slack Web API methods
