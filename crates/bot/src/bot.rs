@@ -319,7 +319,12 @@ fn extract_code_block(input: &str) -> Result<CodeBlock, ParseCommandError> {
 	}
 
 	if let Some(start) = input.find("```") {
-		let code = &input[start + 3..];
+		let fence_length = input[start..]
+			.bytes()
+			.take_while(|&byte| byte == b'`')
+			.count();
+		let fence = &input[start..start + fence_length];
+		let code = &input[start + fence_length..];
 		let (language, code) = code.split_once('\n').map_or((None, code), |(first, rest)| {
 			let first = first.trim();
 			if first.is_empty() || is_code_fence_language(first) {
@@ -328,7 +333,8 @@ fn extract_code_block(input: &str) -> Result<CodeBlock, ParseCommandError> {
 				(None, code)
 			}
 		});
-		let Some(end) = code.find("```") else {
+		// Typst source may contain raw code fences inside the message's wrapper.
+		let Some(end) = code.rfind(fence) else {
 			return Err(ParseCommandError::MissingCode);
 		};
 		return Ok(CodeBlock {
@@ -1401,6 +1407,38 @@ mod tests {
 	#[test]
 	fn restores_math_shorthand_for_ast() {
 		assert_eq!(extract_code_block("$-&gt;$").unwrap().source, "$->$");
+	}
+
+	#[test]
+	fn preserves_nested_raw_code_in_codly_documents() {
+		let source = concat!(
+			"#import \"@preview/codly:1.3.0\": *\n",
+			"#import \"@preview/codly-languages:0.1.1\": *\n",
+			"#show: codly-init.with()\n\n",
+			"#codly(languages: codly-languages)\n",
+			"```rust\n",
+			"pub fn main() {\n",
+			"    println!(\"Hello, world!\");\n",
+			"}\n",
+			"```\n",
+		);
+		for fence in ["```", "````"] {
+			for header in ["\n", "typst\n", ""] {
+				let text = format!("<@U123> r pagesize=preview\n{fence}{header}{source}{fence}");
+				let command = parse_command(&text).unwrap();
+				let (_, code) = parse_render_args(command.args).unwrap();
+				assert_eq!(code.source, source);
+				assert_eq!(extract_code_block(command.args).unwrap().source, source);
+			}
+		}
+	}
+
+	#[test]
+	fn preserves_multiple_nested_code_blocks_and_ignores_trailing_prose() {
+		let source = "```rust\nfn main() {}\n```\n```python\nprint(1)\n```\n";
+		let code = extract_code_block(&format!("```typst\n{source}``` trailing")).unwrap();
+		assert_eq!(code.source, source);
+		assert!(extract_code_block("````typst\nHello\n```").is_err());
 	}
 
 	#[test]
