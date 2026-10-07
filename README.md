@@ -64,6 +64,25 @@ Subscribe the bot to the `app_mention` bot event. Required bot token scopes:
 The bot replies in a thread under the mention. Rendered PNGs are uploaded using
 Slack's current external upload flow, not the retired `files.upload` method.
 
+To also send a reply to the channel, add `broadcast=true` immediately after the
+command name, before any other flags:
+
+```text
+@typst-bot render broadcast=true pagesize=preview `Hello, world!`
+@typst-bot ast broadcast=true `$x^2$`
+@typst-bot version broadcast=true
+```
+
+The default is `broadcast=false` (thread only). This option applies to all
+commands and their error replies. Mentions inside a thread reply to its parent
+thread. Package download progress stays in the thread even with broadcasting
+enabled.
+
+For rendered images, the bot attaches the uploaded PNGs to one thread reply and
+broadcasts that same reply with Slack's `chat.update` API. This shares the actual
+rendered reply, not a separate completion notification. The existing
+`chat:write` and `files:write` scopes are sufficient.
+
 ### Docker
 
 There is a `Dockerfile` and `docker-compose.yml` for running the bot inside a

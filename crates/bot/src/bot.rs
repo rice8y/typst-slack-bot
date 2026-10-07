@@ -179,7 +179,7 @@ fn render_help() -> String {
 Render Typst code as an image.
 
 Render command syntax:
-- `@typst-bot render [pagesize=<page size>] [theme=<theme>] <code block> [...]`
+- `@typst-bot render [broadcast=true|false] [pagesize=<page size>] [theme=<theme>] <code block> [...]`
 - Aliases: `@typst-bot r ps={{p,a,d}} t={{d,l,t}} <code block> [...]`
 
 *Flags*
@@ -191,6 +191,9 @@ Render command syntax:
   - `dark` (alias `d`, default): Set text and background to match Slack's light theme
   - `light` (alias `l`): Set the background to white
   - `transparent` (alias `t`): Leave the background transparent
+- `broadcast=true`: Also send the reply to the channel. Put this immediately
+  after the command name, before render flags. Default: `broadcast=false`.
+  The rendered reply itself, including its images, is also sent to the channel.
 
 To be clear, the full default preamble is:
 ```
@@ -207,6 +210,8 @@ To remove the preamble entirely, use `pagesize=default theme=transparent`.
 @typst-bot render `hello, world!`
 
 @typst-bot r ps=a t=l `Short syntax!`
+
+@typst-bot render broadcast=true `Shared with the channel`
 
 @typst-bot render pagesize=default theme=light ````
 = Heading!
@@ -236,6 +241,8 @@ enum ParseCommandError {
 	InvalidTheme,
 	#[error("invalid page size")]
 	InvalidPageSize,
+	#[error("invalid broadcast option: use broadcast=true or broadcast=false immediately after the command name")]
+	InvalidBroadcast,
 	#[error("unrecognized flag {0:?}")]
 	UnrecognizedFlag(String),
 }
@@ -310,6 +317,23 @@ fn split_first_token(input: &str) -> Option<(&str, &str)> {
 		return Some((input, ""));
 	};
 	Some((&input[..end], &input[end..]))
+}
+
+fn parse_reply_options(input: &str) -> Result<(bool, &str), ParseCommandError> {
+	let mut broadcast = false;
+	let mut remaining = input.trim_start();
+	while let Some((token, rest)) = split_first_token(remaining) {
+		let Some(value) = token.strip_prefix("broadcast=") else {
+			break;
+		};
+		broadcast = match value {
+			"true" => true,
+			"false" => false,
+			_ => return Err(ParseCommandError::InvalidBroadcast),
+		};
+		remaining = rest.trim_start();
+	}
+	Ok((broadcast, remaining))
 }
 
 fn extract_code_block(input: &str) -> Result<CodeBlock, ParseCommandError> {
@@ -455,6 +479,7 @@ fn interpolate<'a>(template: &str, mut params: impl Iterator<Item = &'a str>) ->
 struct SlackClient {
 	token: Arc<str>,
 	client: Client,
+	api_base: Arc<str>,
 }
 
 impl SlackClient {
@@ -462,6 +487,7 @@ impl SlackClient {
 		Self {
 			token: Arc::from(token),
 			client: Client::new(),
+			api_base: Arc::from("https://slack.com/api"),
 		}
 	}
 
@@ -470,31 +496,35 @@ impl SlackClient {
 		target: &SlackTarget,
 		text: impl Into<String>,
 	) -> Result<(), BotError> {
-		let response: SlackApiResponse = self
+		self.post_message_response(target, text.into()).await?;
+		Ok(())
+	}
+
+	async fn post_message_response(
+		&self,
+		target: &SlackTarget,
+		text: String,
+	) -> Result<SlackMessageResponse, BotError> {
+		let response: SlackMessageResponse = self
 			.client
-			.post("https://slack.com/api/chat.postMessage")
+			.post(format!("{}/chat.postMessage", self.api_base))
 			.bearer_auth(&*self.token)
-			.json(&json!({
-				"channel": target.channel,
-				"thread_ts": target.thread_ts,
-				"text": text.into(),
-				"unfurl_links": false,
-				"unfurl_media": false,
-			}))
+			.json(&target.message_payload(&text))
 			.send()
 			.await?
 			.json()
 			.await?;
-		response.into_result("chat.postMessage")
+		response.api.check("chat.postMessage")?;
+		Ok(response)
 	}
 
 	async fn upload_png(
 		&self,
-		target: &SlackTarget,
+		target: Option<&SlackTarget>,
 		filename: &str,
 		image: Vec<u8>,
 		initial_comment: Option<String>,
-	) -> Result<(), BotError> {
+	) -> Result<String, BotError> {
 		#[derive(Deserialize)]
 		struct UploadUrlResponse {
 			ok: bool,
@@ -508,7 +538,7 @@ impl SlackClient {
 		let alt_txt = format!("Typst rendered page {filename}");
 		let upload_url_response: UploadUrlResponse = self
 			.client
-			.post("https://slack.com/api/files.getUploadURLExternal")
+			.post(format!("{}/files.getUploadURLExternal", self.api_base))
 			.bearer_auth(&*self.token)
 			.form(&[
 				("filename", filename),
@@ -557,35 +587,132 @@ impl SlackClient {
 			);
 		}
 
-		let mut complete_upload = serde_json::Map::from_iter([
-			(
+		let mut complete_upload = serde_json::Map::from_iter([(
+			"files".to_owned(),
+			json!([{"id": file_id, "title": filename}]),
+		)]);
+		if let Some(target) = target {
+			complete_upload.insert(
 				"channel_id".to_owned(),
 				Value::String(target.channel.clone()),
-			),
-			(
+			);
+			complete_upload.insert(
 				"thread_ts".to_owned(),
 				Value::String(target.thread_ts.clone()),
-			),
-			(
-				"files".to_owned(),
-				json!([{"id": file_id, "title": filename}]),
-			),
-		]);
+			);
+		}
 		if let Some(initial_comment) = initial_comment {
 			complete_upload.insert("initial_comment".to_owned(), Value::String(initial_comment));
 		}
 
 		let response: SlackApiResponse = self
 			.client
-			.post("https://slack.com/api/files.completeUploadExternal")
+			.post(format!("{}/files.completeUploadExternal", self.api_base))
 			.bearer_auth(&*self.token)
 			.json(&complete_upload)
 			.send()
 			.await?
 			.json()
 			.await?;
-		response.into_result("files.completeUploadExternal")
+		response.into_result("files.completeUploadExternal")?;
+		Ok(file_id)
 	}
+
+	async fn post_rendered(
+		&self,
+		target: &SlackTarget,
+		res: protocol::Rendered,
+	) -> Result<(), BotError> {
+		let mut content = String::new();
+		if res.images.is_empty() {
+			writeln!(content, "Note: no pages generated")?;
+		}
+		if res.more_pages > 0 {
+			writeln!(
+				content,
+				"Note: {} more page{} ignored",
+				res.more_pages,
+				if res.more_pages == 1 { "" } else { "s" },
+			)?;
+		}
+		if !res.warnings.is_empty() {
+			writeln!(
+				content,
+				"Render succeeded with warnings:\n{}",
+				code_block(&res.warnings)
+			)?;
+		}
+
+		let page_count = res.images.len();
+		if page_count == 0 {
+			return self.post_message(target, content).await;
+		}
+		let mut file_ids = Vec::with_capacity(page_count);
+		for (i, image) in res.images.into_iter().enumerate() {
+			let upload_target = (!target.reply_broadcast).then_some(target);
+			let comment =
+				(upload_target.is_some() && i == 0 && !content.is_empty()).then(|| content.clone());
+			let id = self
+				.upload_png(
+					upload_target,
+					&format!("page-{}.png", i + 1),
+					image,
+					comment,
+				)
+				.await?;
+			file_ids.push(id);
+		}
+		// Slack requires attaching files and broadcasting an existing reply in separate updates.
+		if target.reply_broadcast {
+			let text = if content.is_empty() {
+				"Typst".to_owned()
+			} else {
+				content
+			};
+			let posted = self
+				.post_message_response(&target.thread_only(), text.clone())
+				.await?;
+			let ts = posted
+				.ts
+				.filter(|ts| !ts.is_empty())
+				.ok_or("chat.postMessage response did not include ts")?;
+			self
+				.update_message(json!({
+					"channel": target.channel,
+					"ts": ts,
+					"file_ids": file_ids,
+				}))
+				.await?;
+			self.update_message(json!({
+				"channel": target.channel,
+				"ts": ts,
+				"reply_broadcast": true,
+			})).await.map_err(|error| -> BotError {
+				format!("The rendered reply remains in the thread, but sending it to the channel failed: {error}").into()
+			})?;
+		}
+		Ok(())
+	}
+
+	async fn update_message(&self, payload: Value) -> Result<(), BotError> {
+		let response: SlackApiResponse = self
+			.client
+			.post(format!("{}/chat.update", self.api_base))
+			.bearer_auth(&*self.token)
+			.json(&payload)
+			.send()
+			.await?
+			.json()
+			.await?;
+		response.into_result("chat.update")
+	}
+}
+
+#[derive(Deserialize)]
+struct SlackMessageResponse {
+	#[serde(flatten)]
+	api: SlackApiResponse,
+	ts: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -602,13 +729,17 @@ struct SlackResponseMetadata {
 
 impl SlackApiResponse {
 	fn into_result(self, method: &str) -> Result<(), BotError> {
+		self.check(method)
+	}
+
+	fn check(&self, method: &str) -> Result<(), BotError> {
 		if self.ok {
 			Ok(())
 		} else {
 			Err(
 				format!(
 					"{method} failed: {}{}",
-					self.error.unwrap_or_else(|| "unknown error".to_owned()),
+					self.error.as_deref().unwrap_or("unknown error"),
 					format_response_metadata(self.response_metadata.as_ref()),
 				)
 				.into(),
@@ -640,6 +771,35 @@ fn code_block(raw: &str) -> String {
 struct SlackTarget {
 	channel: String,
 	thread_ts: String,
+	reply_broadcast: bool,
+}
+
+impl SlackTarget {
+	fn new(channel: String, ts: String, thread_ts: Option<String>) -> Self {
+		Self {
+			channel,
+			thread_ts: thread_ts.unwrap_or(ts),
+			reply_broadcast: false,
+		}
+	}
+
+	fn message_payload(&self, text: &str) -> Value {
+		json!({
+			"channel": self.channel,
+			"thread_ts": self.thread_ts,
+			"reply_broadcast": self.reply_broadcast,
+			"text": text,
+			"unfurl_links": false,
+			"unfurl_media": false,
+		})
+	}
+
+	fn thread_only(&self) -> Self {
+		Self {
+			reply_broadcast: false,
+			..self.clone()
+		}
+	}
 }
 
 struct AppState {
@@ -690,7 +850,7 @@ enum SlackRequestBody {
 	EventCallback {
 		team_id: Option<String>,
 		event_id: String,
-		event: SlackEvent,
+		event: Box<SlackEvent>,
 	},
 	#[serde(other)]
 	Unknown,
@@ -703,6 +863,7 @@ struct SlackEvent {
 	user: Option<String>,
 	text: Option<String>,
 	ts: Option<String>,
+	thread_ts: Option<String>,
 	channel: Option<String>,
 	subtype: Option<String>,
 	bot_id: Option<String>,
@@ -763,7 +924,7 @@ async fn handle_slack_events(
 				return text_response(StatusCode::OK, "");
 			}
 			tokio::spawn(async move {
-				if let Err(error) = process_event(state, team_id, event).await {
+				if let Err(error) = process_event(state, team_id, *event).await {
 					tracing::error!(?error, "error while processing Slack event");
 				}
 			});
@@ -847,10 +1008,7 @@ async fn process_event(
 	let Some(ts) = event.ts else {
 		return Ok(());
 	};
-	let target = SlackTarget {
-		channel,
-		thread_ts: ts,
-	};
+	let mut target = SlackTarget::new(channel, ts, event.thread_ts);
 	let scope = format!(
 		"{}:{}",
 		team_id.as_deref().unwrap_or("unknown-team"),
@@ -858,7 +1016,24 @@ async fn process_event(
 	);
 	let user = event.user.unwrap_or_else(|| "unknown-user".to_owned());
 
-	match process_command(&state, &target, &scope, &user, &text).await {
+	let result = async {
+		let command = parse_command(&text)?;
+		let (broadcast, args) = parse_reply_options(command.args)?;
+		target.reply_broadcast = broadcast;
+		process_command(
+			&state,
+			&target,
+			&scope,
+			&user,
+			ParsedCommand {
+				name: command.name,
+				args,
+			},
+		)
+		.await
+	}
+	.await;
+	match result {
 		Ok(()) => Ok(()),
 		Err(error) => {
 			state
@@ -877,9 +1052,8 @@ async fn process_command(
 	target: &SlackTarget,
 	scope: &str,
 	user: &str,
-	text: &str,
+	command: ParsedCommand<'_>,
 ) -> Result<(), BotError> {
-	let command = parse_command(text)?;
 	match command.name {
 		"render" | "r" => render(state, target, command.args).await,
 		"help" => help(state, target, command.args).await,
@@ -909,6 +1083,7 @@ async fn process_command(
 async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<(), BotError> {
 	let (flags, code) = parse_render_args(args)?;
 	let source = flags.preamble.apply(code.source);
+	let progress_target = target.thread_only();
 
 	let mut progress = String::new();
 	let (progress_send, mut progress_recv) = mpsc::channel(4);
@@ -921,54 +1096,14 @@ async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<()
 				progress.push('\n');
 				if state.show_progress {
 					let message = format!("Progress:\n{}", code_block(&progress));
-					_ = state.slack.post_message(target, message).await;
+					_ = state.slack.post_message(&progress_target, message).await;
 				}
 			}
 		})
 	};
 
 	match res {
-		Ok(res) => {
-			let mut content = String::new();
-
-			if res.images.is_empty() {
-				writeln!(content, "Note: no pages generated")?;
-			}
-
-			if res.more_pages > 0 {
-				let more_pages = res.more_pages;
-				writeln!(
-					content,
-					"Note: {more_pages} more page{s} ignored",
-					s = if more_pages == 1 { "" } else { "s" },
-				)?;
-			}
-
-			if !res.warnings.is_empty() {
-				writeln!(
-					content,
-					"Render succeeded with warnings:\n{}",
-					code_block(&res.warnings),
-				)?;
-			}
-
-			let mut images = res.images.into_iter().enumerate().peekable();
-			if images.peek().is_none() {
-				state.slack.post_message(target, content.clone()).await?;
-			}
-
-			for (i, image) in images {
-				let comment = if i == 0 && !content.is_empty() {
-					Some(content.clone())
-				} else {
-					None
-				};
-				state
-					.slack
-					.upload_png(target, &format!("page-{}.png", i + 1), image, comment)
-					.await?;
-			}
-		}
+		Ok(res) => state.slack.post_rendered(target, res).await?,
 		Err(error) => {
 			state
 				.slack
@@ -993,7 +1128,10 @@ Commands:
 - `@typst-bot source`: show source URL
 - `@typst-bot tag`, `set-tag`, `delete-tag`, `tags`: channel-local tags
 
-Use `@typst-bot help render` for render syntax."
+Use `@typst-bot help render` for render syntax.
+Add `broadcast=true` immediately after any command name to also send the reply
+to the channel, for example `@typst-bot version broadcast=true`.
+By default, replies are only sent to the thread."
 			.to_owned(),
 		"render" | "r" => render_help(),
 		_ => "No detailed help for that command.".to_owned(),
@@ -1261,8 +1399,86 @@ pub async fn run() {
 }
 
 #[cfg(test)]
+#[path = "slack_reply_tests.rs"]
+mod slack_reply_tests;
+
+#[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn reply_broadcast_is_opt_in_and_preserves_code() {
+		for source in [
+			"`broadcast=true`",
+			"```typst\n#let broadcast = true\n```",
+			"ps=p t=l `x`",
+			"",
+		] {
+			let (broadcast, args) = parse_reply_options(source).unwrap();
+			assert!(!broadcast);
+			assert_eq!(args, source);
+		}
+	}
+
+	#[test]
+	fn parses_reply_option_for_all_commands() {
+		for name in [
+			"render",
+			"r",
+			"ast",
+			"version",
+			"help",
+			"source",
+			"tag",
+			"set-tag",
+			"delete-tag",
+			"tags",
+		] {
+			let input = format!("<@BOT> {name} broadcast=true ps=p ```typst\n= Test\n```");
+			let command = parse_command(&input).unwrap();
+			let (broadcast, args) = parse_reply_options(command.args).unwrap();
+			assert!(broadcast);
+			assert_eq!(command.name, name);
+			assert_eq!(args, "ps=p ```typst\n= Test\n```");
+		}
+		let (broadcast, args) = parse_reply_options("broadcast=false `hello`").unwrap();
+		assert!(!broadcast);
+		assert_eq!(args, "`hello`");
+		let (broadcast, args) = parse_reply_options("broadcast=true broadcast=false `hello`").unwrap();
+		assert!(!broadcast);
+		assert_eq!(args, "`hello`");
+	}
+
+	#[test]
+	fn rejects_invalid_reply_option() {
+		for value in ["", "yes", "TRUE", "1", "maybe"] {
+			assert!(matches!(
+				parse_reply_options(&format!("broadcast={value} `hello`")),
+				Err(ParseCommandError::InvalidBroadcast)
+			));
+		}
+	}
+
+	#[test]
+	fn replies_use_parent_thread_and_progress_is_never_broadcast() {
+		let mut target = SlackTarget::new("C123".into(), "2.000".into(), Some("1.000".into()));
+		assert_eq!(target.thread_ts, "1.000");
+		assert!(!target.reply_broadcast);
+		target.reply_broadcast = true;
+		let payload = target.message_payload("Result");
+		assert_eq!(payload["channel"], "C123");
+		assert_eq!(payload["thread_ts"], "1.000");
+		assert_eq!(payload["reply_broadcast"], true);
+		assert_eq!(payload["text"], "Result");
+		let progress = target.thread_only().message_payload("Progress");
+		assert_eq!(progress["reply_broadcast"], false);
+		assert_eq!(progress["thread_ts"], "1.000");
+		assert!(target.reply_broadcast);
+		assert_eq!(
+			SlackTarget::new("C123".into(), "2.000".into(), None).thread_ts,
+			"2.000"
+		);
+	}
 
 	#[test]
 	fn parses_mention_command() {
