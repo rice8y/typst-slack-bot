@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use protocol::Rendered;
+use protocol::{Attachment, Rendered};
 use typst::layout::{Axis, Size};
 use typst::utils::Scalar;
 use typst_layout::PagedDocument;
@@ -53,8 +53,12 @@ fn to_string(v: impl ToString) -> String {
 const PAGE_LIMIT: usize = 5;
 const BYTES_LIMIT: usize = 25 * 1024 * 1024;
 
-pub fn render(sandbox: &Sandbox, source: String) -> Result<Rendered, String> {
-	let world = sandbox.with_source(source);
+pub fn render(
+	sandbox: &Sandbox,
+	source: String,
+	attachments: Vec<Attachment>,
+) -> Result<Rendered, String> {
+	let world = sandbox.with_source(source, attachments)?;
 
 	let document = typst::compile::<PagedDocument>(&world);
 	let warnings = document.warnings;

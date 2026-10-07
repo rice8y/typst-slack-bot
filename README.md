@@ -60,6 +60,9 @@ Subscribe the bot to the `app_mention` bot event. Required bot token scopes:
 - `app_mentions:read`
 - `chat:write`
 - `files:write`
+- `files:read` (for input attachments)
+
+Reinstall the app in your workspace after adding a scope.
 
 The bot replies in a thread under the mention. Rendered PNGs are uploaded using
 Slack's current external upload flow, not the retired `files.upload` method.
@@ -112,13 +115,40 @@ to Slack Events API.
 
 Run `@typst-bot help render` for render flags and examples.
 
+### Input Attachments
+
+Attach files to the same message as a `render` / `r` command and refer to them
+by their attachment filenames in Typst. For example, attach `figure.png` and
+send:
+
+```text
+@typst-bot render `#image("figure.png", width: 8cm)`
+```
+
+Attached `.typ`, CSV, JSON, and other files can also be read with Typst's normal
+`import`, `csv`, `json`, and `read` functions. The inline command remains the
+entrypoint. Files from earlier messages or other messages in the thread are not
+loaded. Archives are not unpacked.
+
+Each request accepts up to 10 attachments, at most 10 MiB per file and 20 MiB
+in total. Names must be unique basenames without directory separators or control
+characters; `main.typ` is reserved for the inline entrypoint. External files
+are not supported.
+
+Input attachments are held in memory, not written to the server's filesystem
+or package cache. They are isolated to the current compilation, and the worker
+is retired after a request using attachments, including failed compilations.
+Timeouts terminate the worker. This is not a guarantee of secure erasure from
+OS swap, crash dumps, or backups. The original Slack files are left unchanged.
+
 ### Is it safe to host? Is it true that Typst allows arbitrary code execution?
 
 Typst is fundamentally a sandboxed, interpreted language so there is no such
 thing as "arbitrary code execution". However, Typst documents/code can access
 the host environment in a limited capacity. In CLI usage, documents can read
 files inside the project directory and download packages from the Typst package
-repo. For the bot, only the latter is allowed. Resource exhaustion and DOS
+repo. For the bot, documents can read only the current request's attachments
+and downloaded package files, not arbitrary host files. Resource exhaustion and DOS
 attacks are also addressed with timeouts and automatic worker restarting.
 
 For public deployments, use HTTPS, keep `SLACK_SIGNING_SECRET` private, and put

@@ -2,10 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use protocol::{
+	is_valid_attachment_name, Attachment, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES,
+	MAX_TOTAL_ATTACHMENT_BYTES,
+};
 use typst::diag::{eco_format, FileError, FileResult, PackageError, PackageResult};
 use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::package::PackageSpec;
-use typst::syntax::{FileId, Source, VirtualRoot};
+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt as _};
@@ -77,6 +81,7 @@ pub struct WithSource<'a> {
 	sandbox: &'a Sandbox,
 	source: Source,
 	time: time::OffsetDateTime,
+	files: Mutex<HashMap<FileId, FileEntry>>,
 }
 
 impl Sandbox {
@@ -96,12 +101,57 @@ impl Sandbox {
 		}
 	}
 
-	pub fn with_source(&self, source: String) -> WithSource<'_> {
-		WithSource {
+	pub fn with_source(
+		&self,
+		source: String,
+		attachments: Vec<Attachment>,
+	) -> Result<WithSource<'_>, String> {
+		if attachments.len() > MAX_ATTACHMENTS {
+			return Err(format!(
+				"too many attachments: maximum is {MAX_ATTACHMENTS}"
+			));
+		}
+
+		let mut files = HashMap::with_capacity(attachments.len());
+		let mut total_bytes = 0;
+		for attachment in attachments {
+			if !is_valid_attachment_name(&attachment.name) {
+				return Err(format!("invalid attachment name: {:?}", attachment.name));
+			}
+			if attachment.data.len() > MAX_ATTACHMENT_BYTES {
+				return Err(format!(
+					"attachment {:?} is too large: maximum is {MAX_ATTACHMENT_BYTES} bytes",
+					attachment.name,
+				));
+			}
+			total_bytes += attachment.data.len();
+			if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+				return Err(format!(
+					"attachments are too large: maximum total is {MAX_TOTAL_ATTACHMENT_BYTES} bytes",
+				));
+			}
+
+			let path = VirtualPath::new(&attachment.name)
+				.map_err(|_| format!("invalid attachment name: {:?}", attachment.name))?;
+			let id = RootedPath::new(VirtualRoot::Project, path).intern();
+			if files.contains_key(&id) {
+				return Err(format!("duplicate attachment name: {:?}", attachment.name));
+			}
+			files.insert(
+				id,
+				FileEntry {
+					bytes: Bytes::new(attachment.data),
+					source: None,
+				},
+			);
+		}
+
+		Ok(WithSource {
 			sandbox: self,
 			source: make_source(source),
 			time: get_time(),
-		}
+			files: Mutex::new(files),
+		})
 	}
 
 	/// Returns the system path of the unpacked package.
@@ -189,6 +239,20 @@ impl WithSource<'_> {
 	pub fn main_source(&self) -> &Source {
 		&self.source
 	}
+
+	fn with_file<T>(&self, id: FileId, map: impl FnOnce(&mut FileEntry) -> T) -> FileResult<T> {
+		match id.root() {
+			VirtualRoot::Project => {
+				// Project files exist only in this request; never resolve them on the host.
+				let mut files = self.files.lock().unwrap();
+				let entry = files
+					.get_mut(&id)
+					.ok_or_else(|| FileError::NotFound(id.vpath().get_without_slash().into()))?;
+				Ok(map(entry))
+			}
+			VirtualRoot::Package(_) => self.sandbox.file(id, map),
+		}
+	}
 }
 
 impl typst::World for WithSource<'_> {
@@ -204,7 +268,7 @@ impl typst::World for WithSource<'_> {
 		if id == self.source.id() {
 			Ok(self.source.clone())
 		} else {
-			self.sandbox.file(id, |file| file.source(id))?
+			self.with_file(id, |file| file.source(id))?
 		}
 	}
 
@@ -217,7 +281,7 @@ impl typst::World for WithSource<'_> {
 	}
 
 	fn file(&self, id: FileId) -> FileResult<Bytes> {
-		self.sandbox.file(id, |file| file.bytes.clone())
+		self.with_file(id, |file| file.bytes.clone())
 	}
 
 	fn today(&self, offset: Option<Duration>) -> Option<Datetime> {

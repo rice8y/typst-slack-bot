@@ -47,9 +47,12 @@ fn main() {
 
 		let request: Request = res.unwrap();
 
+		let has_attachments =
+			matches!(&request, Request::Render { attachments, .. } if !attachments.is_empty());
 		let response = match request {
-			Request::Render { code } => {
-				let response = std::panic::catch_unwind(AssertUnwindSafe(|| render(&sandbox, code)));
+			Request::Render { code, attachments } => {
+				let response =
+					std::panic::catch_unwind(AssertUnwindSafe(|| render(&sandbox, code, attachments)));
 				let response = response
 					.map_err(|panic| panic_to_string(&*panic))
 					.and_then(|inner| inner);
@@ -64,7 +67,8 @@ fn main() {
 			}),
 		};
 
-		comemo::evict(100);
+		// Attachment bytes can be retained by memoized compilation, even after errors or panics.
+		comemo::evict(if has_attachments { 0 } else { 100 });
 
 		write_response(&response);
 	}

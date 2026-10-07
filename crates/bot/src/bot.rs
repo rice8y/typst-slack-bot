@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::http::StatusCode;
@@ -23,15 +23,23 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::join;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::time::timeout;
 
 use crate::worker::Worker;
 use crate::SOURCE_URL;
+
+#[path = "attachments.rs"]
+mod attachments;
+use attachments::{AttachmentLoader, SlackFileRef};
 
 /// U+200D is a zero-width joiner.
 /// It prevents the triple backtick from being interpreted as a codeblock but retains ligature support.
 const ZERO_WIDTH_JOINER: char = '\u{200D}';
 const MAX_SLACK_EVENT_BODY_BYTES: u64 = 1024 * 1024;
+const MAX_PENDING_COMMANDS: usize = 8;
+const MAX_HTTP_CONNECTIONS: usize = 64;
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 type BotError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -194,6 +202,13 @@ Render command syntax:
 - `broadcast=true`: Also send the reply to the channel. Put this immediately
   after the command name, before render flags. Default: `broadcast=false`.
   The rendered reply itself, including its images, is also sent to the channel.
+
+*Input attachments*
+Attach files to this same message and refer to their filenames, for example
+`#image(\"figure.png\")`, `#import \"lib.typ\": *`, or `#csv(\"data.csv\")`.
+Up to 10 files, 10 MiB per file, 20 MiB total. Filenames must be unique plain
+basenames; `main.typ` is reserved. Files are used only for this compilation;
+the original Slack files are not deleted. The app needs `files:read`.
 
 To be clear, the full default preamble is:
 ```
@@ -486,7 +501,10 @@ impl SlackClient {
 	fn new(token: String) -> Self {
 		Self {
 			token: Arc::from(token),
-			client: Client::new(),
+			client: Client::builder()
+				.timeout(Duration::from_secs(30))
+				.build()
+				.expect("building Slack HTTP client"),
 			api_base: Arc::from("https://slack.com/api"),
 		}
 	}
@@ -806,6 +824,8 @@ struct AppState {
 	signing_secret: Arc<str>,
 	slack: SlackClient,
 	pool: Mutex<Worker>,
+	attachment_slot: Mutex<()>,
+	command_slots: Arc<Semaphore>,
 	database: std::sync::Mutex<Connection>,
 	seen_events: Mutex<SeenEvents>,
 	tag_admins: HashSet<String>,
@@ -825,6 +845,20 @@ impl SeenEvents {
 			order: VecDeque::new(),
 			set: HashSet::new(),
 		}
+	}
+
+	fn admit(
+		&mut self,
+		event_id: String,
+		slots: &Arc<Semaphore>,
+	) -> Result<Option<OwnedSemaphorePermit>, TryAcquireError> {
+		if self.set.contains(&event_id) {
+			return Ok(None);
+		}
+		// Capacity rejection must leave the event retryable.
+		let permit = Arc::clone(slots).try_acquire_owned()?;
+		self.insert(event_id);
+		Ok(Some(permit))
 	}
 
 	fn insert(&mut self, event_id: String) -> bool {
@@ -867,6 +901,19 @@ struct SlackEvent {
 	channel: Option<String>,
 	subtype: Option<String>,
 	bot_id: Option<String>,
+	#[serde(default)]
+	files: Vec<SlackFileRef>,
+}
+
+impl SlackEvent {
+	fn is_human_mention(&self) -> bool {
+		self.kind == "app_mention"
+			&& self
+				.subtype
+				.as_deref()
+				.is_none_or(|subtype| subtype == "file_share")
+			&& self.bot_id.is_none()
+	}
 }
 
 async fn handle_http_request(
@@ -896,13 +943,19 @@ async fn handle_slack_events(
 		return text_response(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
 	}
 
-	let body = match req.into_body().collect().await {
+	let body = match Limited::new(
+		req.into_body(),
+		MAX_SLACK_EVENT_BODY_BYTES.try_into().unwrap(),
+	)
+	.collect()
+	.await
+	{
 		Ok(collected) => collected.to_bytes(),
+		Err(error) if error.is::<LengthLimitError>() => {
+			return text_response(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
+		}
 		Err(error) => return text_response(StatusCode::BAD_REQUEST, format!("invalid body: {error}")),
 	};
-	if body.len() as u64 > MAX_SLACK_EVENT_BODY_BYTES {
-		return text_response(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
-	}
 
 	if !verify_slack_signature(&headers, &body, &state.signing_secret) {
 		return text_response(StatusCode::UNAUTHORIZED, "invalid Slack signature");
@@ -920,10 +973,21 @@ async fn handle_slack_events(
 			event_id,
 			event,
 		} => {
-			if !state.seen_events.lock().await.insert(event_id) {
+			if !event.is_human_mention() {
 				return text_response(StatusCode::OK, "");
 			}
+			let permit = match state
+				.seen_events
+				.lock()
+				.await
+				.admit(event_id, &state.command_slots)
+			{
+				Ok(Some(permit)) => permit,
+				Ok(None) => return text_response(StatusCode::OK, ""),
+				Err(_) => return text_response(StatusCode::SERVICE_UNAVAILABLE, "command queue is full"),
+			};
 			tokio::spawn(async move {
+				let _permit = permit;
 				if let Err(error) = process_event(state, team_id, *event).await {
 					tracing::error!(?error, "error while processing Slack event");
 				}
@@ -995,7 +1059,7 @@ async fn process_event(
 	team_id: Option<String>,
 	event: SlackEvent,
 ) -> Result<(), BotError> {
-	if event.kind != "app_mention" || event.subtype.is_some() || event.bot_id.is_some() {
+	if !event.is_human_mention() {
 		return Ok(());
 	}
 
@@ -1029,6 +1093,7 @@ async fn process_event(
 				name: command.name,
 				args,
 			},
+			&event.files,
 		)
 		.await
 	}
@@ -1053,9 +1118,10 @@ async fn process_command(
 	scope: &str,
 	user: &str,
 	command: ParsedCommand<'_>,
+	files: &[SlackFileRef],
 ) -> Result<(), BotError> {
 	match command.name {
-		"render" | "r" => render(state, target, command.args).await,
+		"render" | "r" => render(state, target, command.args, files).await,
 		"help" => help(state, target, command.args).await,
 		"source" => state.slack.post_message(target, SOURCE_URL).await,
 		"ast" => ast(state, target, command.args).await,
@@ -1080,7 +1146,12 @@ async fn process_command(
 	}
 }
 
-async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<(), BotError> {
+async fn render(
+	state: &AppState,
+	target: &SlackTarget,
+	args: &str,
+	files: &[SlackFileRef],
+) -> Result<(), BotError> {
 	let (flags, code) = parse_render_args(args)?;
 	let source = flags.preamble.apply(code.source);
 	let progress_target = target.thread_only();
@@ -1088,8 +1159,30 @@ async fn render(state: &AppState, target: &SlackTarget, args: &str) -> Result<()
 	let mut progress = String::new();
 	let (progress_send, mut progress_recv) = mpsc::channel(4);
 	let (res, ()) = {
-		let mut pool = state.pool.lock().await;
-		join!(pool.render(source, progress_send), async {
+		let _attachment_slot = if files.is_empty() {
+			None
+		} else {
+			Some(
+				timeout(QUEUE_TIMEOUT, state.attachment_slot.lock())
+					.await
+					.map_err(|_| "attachment queue is busy; please try again")?,
+			)
+		};
+		let attachments = if files.is_empty() {
+			Vec::new()
+		} else {
+			AttachmentLoader::new(
+				&state.slack.client,
+				&state.slack.token,
+				&state.slack.api_base,
+			)?
+			.load(files)
+			.await?
+		};
+		let mut pool = timeout(QUEUE_TIMEOUT, state.pool.lock())
+			.await
+			.map_err(|_| "render queue is busy; please try again")?;
+		join!(pool.render(source, attachments, progress_send), async {
 			while let Some(item) = progress_recv.recv().await {
 				progress.reserve(item.len() + 1);
 				progress.push_str(&item);
@@ -1141,7 +1234,11 @@ By default, replies are only sent to the thread."
 
 async fn ast(state: &AppState, target: &SlackTarget, args: &str) -> Result<(), BotError> {
 	let code = extract_code_block(args)?;
-	let res = state.pool.lock().await.ast(code.source).await;
+	let res = timeout(QUEUE_TIMEOUT, state.pool.lock())
+		.await
+		.map_err(|_| "worker queue is busy; please try again")?
+		.ast(code.source)
+		.await;
 
 	match res {
 		Ok(ast) => {
@@ -1158,7 +1255,11 @@ async fn ast(state: &AppState, target: &SlackTarget, args: &str) -> Result<(), B
 }
 
 async fn version(state: &AppState, target: &SlackTarget) -> Result<(), BotError> {
-	let res = state.pool.lock().await.version().await;
+	let res = timeout(QUEUE_TIMEOUT, state.pool.lock())
+		.await
+		.map_err(|_| "worker queue is busy; please try again")?
+		.version()
+		.await;
 
 	match res {
 		Ok(VersionResponse {
@@ -1376,6 +1477,8 @@ pub async fn run() {
 		signing_secret: Arc::from(signing_secret),
 		slack: SlackClient::new(token),
 		pool: Mutex::new(pool),
+		attachment_slot: Mutex::new(()),
+		command_slots: Arc::new(Semaphore::new(MAX_PENDING_COMMANDS)),
 		database,
 		seen_events: Mutex::new(SeenEvents::new()),
 		tag_admins,
@@ -1384,14 +1487,25 @@ pub async fn run() {
 
 	let listener = TcpListener::bind(bind_addr).await.unwrap();
 	eprintln!("ready: listening on http://{bind_addr}/slack/events");
+	let connection_slots = Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS));
 
 	loop {
 		let (stream, _) = listener.accept().await.unwrap();
+		let Ok(permit) = Arc::clone(&connection_slots).try_acquire_owned() else {
+			drop(stream);
+			continue;
+		};
 		let state = Arc::clone(&state);
 		tokio::spawn(async move {
+			let _permit = permit;
 			let io = TokioIo::new(stream);
 			let service = service_fn(move |req| handle_http_request(req, Arc::clone(&state)));
-			if let Err(error) = http1::Builder::new().serve_connection(io, service).await {
+			if let Ok(Err(error)) = timeout(
+				Duration::from_secs(60),
+				http1::Builder::new().serve_connection(io, service),
+			)
+			.await
+			{
 				tracing::error!(?error, "error serving HTTP connection");
 			}
 		});
@@ -1404,6 +1518,92 @@ mod slack_reply_tests;
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn capacity_rejection_is_retryable_and_duplicates_succeed_at_capacity() {
+		let slots = Arc::new(Semaphore::new(1));
+		let mut seen = SeenEvents::new();
+		let permit = seen.admit("first".into(), &slots).unwrap().unwrap();
+		assert!(seen.admit("second".into(), &slots).is_err());
+		assert!(!seen.set.contains("second"));
+		assert!(seen.admit("first".into(), &slots).unwrap().is_none());
+		drop(permit);
+		assert!(seen.admit("second".into(), &slots).unwrap().is_some());
+		assert_eq!(slots.available_permits(), 1);
+	}
+
+	#[tokio::test]
+	async fn concurrent_duplicate_events_admit_exactly_one_command() {
+		let slots = Arc::new(Semaphore::new(MAX_PENDING_COMMANDS));
+		let seen = Arc::new(Mutex::new(SeenEvents::new()));
+		let mut tasks = Vec::new();
+		for _ in 0..32 {
+			let slots = Arc::clone(&slots);
+			let seen = Arc::clone(&seen);
+			tasks.push(tokio::spawn(async move {
+				seen
+					.lock()
+					.await
+					.admit("same-event".into(), &slots)
+					.unwrap()
+			}));
+		}
+		let mut accepted = Vec::new();
+		for task in tasks {
+			if let Some(permit) = task.await.unwrap() {
+				accepted.push(permit);
+			}
+		}
+		assert_eq!(accepted.len(), 1);
+		assert_eq!(slots.available_permits(), MAX_PENDING_COMMANDS - 1);
+		drop(accepted);
+		assert_eq!(slots.available_permits(), MAX_PENDING_COMMANDS);
+	}
+
+	#[tokio::test]
+	async fn cancelling_an_admitted_command_releases_capacity() {
+		let slots = Arc::new(Semaphore::new(1));
+		let permit = SeenEvents::new()
+			.admit("event".into(), &slots)
+			.unwrap()
+			.unwrap();
+		let (ready, started) = tokio::sync::oneshot::channel();
+		let task = tokio::spawn(async move {
+			let _permit = permit;
+			ready.send(()).unwrap();
+			std::future::pending::<()>().await;
+		});
+		started.await.unwrap();
+		assert_eq!(slots.available_permits(), 0);
+		task.abort();
+		assert!(task.await.unwrap_err().is_cancelled());
+		assert_eq!(slots.available_permits(), 1);
+	}
+
+	#[test]
+	fn accepts_mention_attachments_but_not_bot_or_changed_events() {
+		let mut payload = serde_json::json!({
+			"type": "app_mention", "subtype": "file_share",
+			"files": [{"id": "F123", "name": "figure.png"}],
+			"text": "<@U123> r `#image(\"figure.png\")`"
+		});
+		let event: SlackEvent = serde_json::from_value(payload.clone()).unwrap();
+		assert!(event.is_human_mention());
+		assert_eq!(event.files[0].id, "F123");
+		payload["bot_id"] = "B123".into();
+		assert!(!serde_json::from_value::<SlackEvent>(payload.clone())
+			.unwrap()
+			.is_human_mention());
+		payload.as_object_mut().unwrap().remove("bot_id");
+		payload["subtype"] = "message_changed".into();
+		assert!(!serde_json::from_value::<SlackEvent>(payload.clone())
+			.unwrap()
+			.is_human_mention());
+		payload.as_object_mut().unwrap().remove("subtype");
+		payload.as_object_mut().unwrap().remove("files");
+		let event: SlackEvent = serde_json::from_value(payload).unwrap();
+		assert!(event.is_human_mention());
+		assert!(event.files.is_empty());
+	}
 	use super::*;
 
 	#[test]
